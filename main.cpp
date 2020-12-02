@@ -11,6 +11,8 @@
 # include <netinet/tcp.h>
 # include <pcap.h>
 
+const char* finMsg = "blocked!!!";
+
 # pragma pack(push, 1)
 struct pkthdr {
 	struct ether_header _ethhdr;
@@ -63,6 +65,7 @@ void getMyMac(u_int8_t* myMac, const char* dev) {
 	memcpy(myMac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
 	close(fd);
 }
+
 char* parseOrgPkt(struct pkthdr* orgpkt, const u_char* packet) {
 	char* ptr = (char*) packet;
 	
@@ -78,32 +81,60 @@ char* parseOrgPkt(struct pkthdr* orgpkt, const u_char* packet) {
 	return ptr;
 }
 
-void printMac(u_int8_t* mac) {
-	for (int i = 0; i < ETH_ALEN; i++)
-		printf("%02x ", *(mac + i));
-	putchar('\n');
-}
-/*
-void printInfo(struct pkthdr orgpkt) {
-		struct in_addr addr;
+// Reference: https://moltak.tistory.com/288
+void ipChecksum(struct iphdr* ipHeader) {
+	unsigned short* plpH = (unsigned short*) ipHeader;
+	unsigned short nLen = ipHeader->ihl << 2;
+	unsigned int chksum = 0;
+	unsigned short finalchk;
+	
+	// sum over 2bytes
+	ipHeader->check = 0;
+	for (int i = 0; i < nLen; i += 2)
+		chksum += *plpH++;
+	
+	// folding & one's complement
+	chksum = (chksum >> 16) + (chksum & 0xffff);
+	chksum += (chksum >> 16);
+	finalchk = (~chksum & 0xffff);
 
-                printf("smac: "); printMac(orgpkt._ethhdr.ether_shost);
-                printf("dmac: "); printMac(orgpkt._ethhdr.ether_dhost);
-                
-		addr.s_addr = orgpkt._iphdr.saddr;
-                printf("sip: %s\n", inet_ntoa(addr));
-                addr.s_addr = orgpkt._iphdr.daddr;
-                printf("dip: %s\n", inet_ntoa(addr));
+	ipHeader->check = finalchk;
+}	
 
-                printf("sport: %d\n", ntohs(orgpkt._tcphdr.source));
-                printf("dport: %d\n", ntohs(orgpkt._tcphdr.dest));
-                
-		printf("msg: ");
-                for (int i = 0; i < 4; i++)
-                        printf("%c ", *(msg + i));
-                putchar('\n');
+void tcpChecksum(struct iphdr* ipHeader, struct tcphdr* tcpHeader) {
+	unsigned short* pTcpH = (unsigned short*) tcpHeader;
+	unsigned short* tempIP;
+	unsigned short nLen = ntohs(ipHeader->tot_len) - sizeof(iphdr);
+	unsigned int chksum = 0; 
+	unsigned short finalchk;
+
+	// sum over 2bytes
+	tcpHeader->check = 0;
+	for (int i = 0; i < nLen; i += 2)
+		chksum += *pTcpH++;
+	if (nLen % 2 == 1)
+		chksum += *pTcpH;
+
+	// iphdr info
+	tempIP = (unsigned short*)(&ipHeader->saddr);
+	for (int i =0; i < 2; i++)
+		chksum += *tempIP++;
+	
+	tempIP = (unsigned short*)(&ipHeader->daddr);
+	for (int i = 0; i < 2; i++)
+		chksum += *tempIP++;
+	
+	chksum += htons(ipHeader->protocol);
+	chksum += htons(nLen);
+
+	// folding & one's complement
+	chksum = (chksum >> 16) + (chksum & 0xffff);
+	chksum += (chksum >> 16);
+	finalchk = (~chksum & 0xffff);
+
+	tcpHeader->check = finalchk;
 }
-*/
+
 int main(int argc, char* argv[])
 {
 	if (argc != 3) {
@@ -119,7 +150,6 @@ int main(int argc, char* argv[])
 		exit(1);
 	}
 	u_int8_t myMac[ETH_ALEN];
-	const char* finMsg = "blocked!!!";
 	getMyMac(myMac, dev);
 
 	while (true) {
@@ -150,10 +180,12 @@ int main(int argc, char* argv[])
 			
 		/* Ipv4 Header */
 		fpkt._iphdr.ihl = bpkt._iphdr.ihl = 5;
-		fpkt._iphdr.tot_len = htons(((u_int16_t)sizeof(iphdr) + (u_int16_t)sizeof(tcphdr)) >> 2);
-		bpkt._iphdr.tot_len = htons(((u_int16_t)sizeof(iphdr) + (u_int16_t)sizeof(tcphdr) + (u_int16_t)strlen(finMsg)) >> 2);
+		fpkt._iphdr.tot_len = htons((u_int16_t)(sizeof(iphdr) + sizeof(tcphdr)));
+		bpkt._iphdr.tot_len = htons((u_int16_t)(sizeof(iphdr) + (u_int16_t)sizeof(tcphdr) + (u_int16_t)strlen(finMsg)));
 		bpkt._iphdr.ttl = (u_int8_t)0x80;
-		
+		bpkt._iphdr.saddr = orgpkt._iphdr.daddr;
+		bpkt._iphdr.daddr = orgpkt._iphdr.saddr;
+
 		/* TCP Header */
 		bpkt._tcphdr.source = orgpkt._tcphdr.dest;
 		bpkt._tcphdr.dest = orgpkt._tcphdr.source;
@@ -162,24 +194,32 @@ int main(int argc, char* argv[])
 		fpkt._tcphdr.seq = htonl(ntohl(orgpkt._tcphdr.seq) + (u_int32_t)tot_orglen);
 		bpkt._tcphdr.seq = orgpkt._tcphdr.ack_seq;
 		fpkt._tcphdr.ack_seq = orgpkt._tcphdr.ack_seq;
-		bpkt._tcphdr.ack_seq = orgpkt._tcphdr.seq; // why not + tot_orglen?
+		bpkt._tcphdr.ack_seq = orgpkt._tcphdr.seq;
 		
-		fpkt._tcphdr.doff = bpkt._tcphdr.doff = (sizeof(tcphdr) >> 6);
-		fpkt._tcphdr.ack = fpkt._tcphdr.fin = 1;
-		bpkt._tcphdr.rst = 1;
-	
+		fpkt._tcphdr.doff = bpkt._tcphdr.doff = (sizeof(tcphdr) >> 2);
+		fpkt._tcphdr.rst = 1;
+		bpkt._tcphdr.ack = bpkt._tcphdr.fin = 1;
+
+		/* block packet generation */
 		u_char* sendbpkt = (u_char*)malloc(sizeof(bpkt) + strlen(finMsg));
 		memcpy(sendbpkt, &bpkt, sizeof(bpkt));
 		memcpy(sendbpkt + sizeof(bpkt), finMsg, strlen(finMsg));
+		struct iphdr* sendb_pIph = (iphdr*)(sendbpkt + sizeof(ether_header));
+		struct tcphdr* sendb_pTcph = (tcphdr*)(sendbpkt + sizeof(ether_header) + sizeof(iphdr));
 
-		// printf("bpkt rst: %u\n",bpkt._tcphdr.rst); 
-
+		/* Checksum */
+		ipChecksum(&(fpkt._iphdr));
+                ipChecksum(sendb_pIph);
+                tcpChecksum(&(fpkt._iphdr), &(fpkt._tcphdr));
+                tcpChecksum(sendb_pIph, sendb_pTcph);
+		
 		int resf = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&fpkt), sizeof(fpkt));
 		int resb = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(sendbpkt), sizeof(bpkt) + strlen(finMsg));
 		if (resf != 0 || resb != 0) {
-			fprintf(stderr, "pcap_sendpacket failed, return %d %d error %s\n", resf, resb, pcap_geterr(handle));
+			fprintf(stderr, "pcap_sendpacket failed\n");
 			exit(1);
 		}
+		printf("block packet sent\n");
 		free(sendbpkt);
 	}
 	pcap_close(handle);
